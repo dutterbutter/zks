@@ -1,0 +1,136 @@
+name: build-and-release-zksync-os-server
+
+on:
+  push:
+    tags:
+      - "v*.*.*"     # Tag this repo e.g. v0.7.5
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (defaults to this repo tag when triggered by tag push)"
+        required: false
+        type: string
+
+permissions:
+  contents: write   # needed to upload release assets
+
+env:
+  UPSTREAM_REPO: matter-labs/zksync-os-server
+  SERVER_BIN: zksync_os_bin
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux (portable MUSL + common GNU)
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-musl, archive: tar.gz }
+          - { os: ubuntu-22.04, target: aarch64-unknown-linux-musl, archive: tar.gz }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu,  archive: tar.gz }
+
+          # macOS (Intel + Apple Silicon)
+          - { os: macos-13, target: x86_64-apple-darwin,  archive: tar.gz }
+          - { os: macos-14, target: aarch64-apple-darwin, archive: tar.gz }
+
+    steps:
+      - name: Resolve tags
+        id: tag
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.upstream_tag }}" ]]; then
+            echo "UPSTREAM_TAG=${{ github.event.inputs.upstream_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "UPSTREAM_TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+          echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Checkout upstream source (${{ steps.tag.outputs.UPSTREAM_TAG }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.tag.outputs.UPSTREAM_TAG }}
+          path: upstream
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: MUSL toolchain (Linux MUSL targets)
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+
+      # Adjust -p/--bin if upstream is a workspace with a different package/bin name.
+      - name: Build
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Example alternatives if needed:
+          cargo build --bin zksync_os_bin --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="${{ env.SERVER_BIN }}"
+          TGT="${{ matrix.target }}"
+          OUT="upstream/target/${TGT}/release"
+          DST="server-${TGT}"
+          mkdir -p "$DST"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "${OUT}/${BIN}.exe" "${DST}/${BIN}.exe"
+          else
+            # Some builds may have suffixes; copy the binary that matches.
+            if [[ -f "${OUT}/${BIN}" ]]; then
+              cp "${OUT}/${BIN}" "${DST}/${BIN}"
+            else
+              cp "${OUT}/${BIN}-"* "${DST}/${BIN}" 2>/dev/null || cp "${OUT}/"*"${BIN}"* "${DST}/${BIN}"
+            fi
+            ( strip "${DST}/${BIN}" || true )
+          fi
+
+          echo "Built from ${{ env.UPSTREAM_REPO }} @ ${{ steps.tag.outputs.UPSTREAM_TAG }}" > "${DST}/BUILDINFO.txt"
+
+          if [[ "${{ matrix.archive }}" == "tar.gz" ]]; then
+            ARCHIVE="${BIN}-${TGT}.tar.gz"
+            tar -C "$DST" -czf "$ARCHIVE" .
+          else
+            ARCHIVE="${BIN}-${TGT}.zip"
+            (cd "$DST" && 7z a -tzip "../$ARCHIVE" .)
+          fi
+
+          (shasum -a 256 "$ARCHIVE" || sha256sum "$ARCHIVE") > "${ARCHIVE}.sha256"
+
+          echo "ARCHIVE=$ARCHIVE"  >> $GITHUB_OUTPUT
+          echo "CHECKSUM=${ARCHIVE}.sha256" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release (archive)
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.tag.outputs.RELEASE_TAG }}
+          file: ${{ steps.pkg.outputs.ARCHIVE }}
+          asset_name: ${{ steps.pkg.outputs.ARCHIVE }}
+          overwrite: true
+
+      - name: Upload to Release (checksum)
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.tag.outputs.RELEASE_TAG }}
+          file: ${{ steps.pkg.outputs.CHECKSUM }}
+          asset_name: ${{ steps.pkg.outputs.CHECKSUM }}
+          overwrite: true
