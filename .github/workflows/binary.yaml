@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euxo pipefail
           # Example alternatives if needed:
-          cargo build --bin zksync_os_bin --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         id: pkg
